@@ -19,7 +19,7 @@ from PIL import Image
 import warnings
 warnings.filterwarnings('ignore')
 
-# ===================== 0. 全局配置 & 核心常量（仅新增ZeroMQ相关配置） =====================
+# ===================== 0. 全局配置 & 核心常量（仅新增点云缩放因子配置） =====================
 CONFIG_PATH = "configs/bevdet/bevdet-r50.py"
 WEIGHT_PATH = "/workspace/BEV/ckpt/bevdet-dev2.1/bevdet-r50.pth"
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -36,6 +36,8 @@ VIS_SAVE_PATH = "./bevdet_vis_results"  # 最终图像保存目录
 SHOW_RANGE = 50  
 CANVA_SIZE = 1000  
 SCALE_FACTOR = 4  
+# 【新增】点云显示范围缩放因子（核心新增配置）
+POINT_RANGE_SCALE = 2.0  # >1扩大显示范围，<1缩小，默认1.0不变
 
 # Pipeline核心配置
 DATA_CONFIG = {
@@ -266,7 +268,7 @@ class ZMQDataReceiver:
         self.socket.close()
         self.zmq_context.term()
 
-# ===================== 3. 绘制函数（完全保持不变） =====================
+# ===================== 3. 绘制函数（核心修改：添加点云缩放因子） =====================
 def draw_3d_box_on_img_ref(img, bbox_3d, camera_info):
     if len(bbox_3d) == 0:
         return img
@@ -294,14 +296,15 @@ def draw_3d_box_on_img_ref(img, bbox_3d, camera_info):
                 )
     return img
 
-def draw_bev_view(lidar_points, valid_bboxes, scores):
+def draw_bev_view(lidar_points, valid_bboxes, scores, point_scale=POINT_RANGE_SCALE):  # 新增缩放参数
     canvas = np.zeros((int(CANVA_SIZE), int(CANVA_SIZE), 3), dtype=np.uint8)
     
-    # 绘制雷达点云
+    # 绘制雷达点云（核心修改：应用缩放因子）
     if len(lidar_points) > 0:
         lidar_xyz = lidar_points.copy()
         lidar_xyz[:, 1] = -lidar_xyz[:, 1]
-        lidar_xyz[:, :2] = (lidar_xyz[:, :2] + SHOW_RANGE) / SHOW_RANGE / 2.0 * CANVA_SIZE
+        # 应用点云显示范围缩放因子（仅修改这一行）
+        lidar_xyz[:, :2] = (lidar_xyz[:, :2] * point_scale + SHOW_RANGE) / SHOW_RANGE / 2.0 * CANVA_SIZE
         
         for p in lidar_xyz:
             if check_point_in_img(p.reshape(1, 3), canvas.shape[1], canvas.shape[0])[0]:
@@ -312,7 +315,7 @@ def draw_bev_view(lidar_points, valid_bboxes, scores):
                     color=color,
                     thickness=1)
     
-    # 绘制3D框BEV投影
+    # 绘制3D框BEV投影（完全不变，不受缩放影响）
     if len(valid_bboxes) > 0:
         corners_lidar = valid_bboxes.corners.numpy().reshape(-1, 8, 3)
         # corners_lidar[:, :, 1] = -corners_lidar[:, :, 1]
@@ -590,10 +593,10 @@ def infer_bevdet(cfg, model, input_data):
     print(f"原始框数量: {len(bboxes_3d)} | 过滤后: {len(valid_bboxes)}")
     return result, valid_bboxes, valid_scores, labels
 
-# ===================== 5. 【修改】主函数（新增点云旋转参数） =====================
+# ===================== 5. 【修改】主函数（新增点云缩放参数调参） =====================
 def main():
-    global VIS_THRED
-    parser = argparse.ArgumentParser(description='BEVDet可视化 - ZeroMQ数据输入 | 点云绕Z轴旋转90度 | 仅输出最终融合图像')
+    global VIS_THRED, POINT_RANGE_SCALE
+    parser = argparse.ArgumentParser(description='BEVDet可视化 - ZeroMQ数据输入 | 点云绕Z轴旋转90度 | 点云显示缩放 | 仅输出最终融合图像')
     parser.add_argument('--zmq-addr', type=str, default=ZMQ_SUB_ADDR, help='ZeroMQ服务端地址')
     parser.add_argument('--vis-thred', type=float, default=VIS_THRED, help='检测框可视化阈值')
     # 【新增】点云旋转方向参数
@@ -603,10 +606,16 @@ def main():
         choices=["clockwise", "counterclockwise"],
         help="点云绕Z轴旋转方向（默认：clockwise 顺时针；可选 counterclockwise 逆时针）"
     )
+    # 【新增】点云显示范围缩放参数
+    parser.add_argument('--point-scale', type=float, default=POINT_RANGE_SCALE, 
+                        help='点云显示范围缩放因子（>1扩大显示范围，<1缩小，默认1.0）')
+    
     args = parser.parse_args()
     
-    # 更新可视化阈值
+    # 更新参数
     VIS_THRED = args.vis_thred
+    POINT_RANGE_SCALE = args.point_scale  # 更新点云缩放因子
+    print(f"📌 当前点云显示范围缩放因子：{POINT_RANGE_SCALE}")
     
     try:
         # 【修改】初始化ZeroMQ接收器（传入点云旋转参数）
@@ -633,7 +642,7 @@ def main():
                 # 模型推理（保持不变）
                 _, valid_bboxes, valid_scores, _ = infer_bevdet(cfg, model, input_data)
                 
-                # 生成可视化图像（保持不变）
+                # 生成可视化图像（传入点云缩放因子）
                 print(f"\n===================== 生成最终可视化图像 =====================")
                 vis_imgs = []
                 
@@ -647,8 +656,8 @@ def main():
                     else:
                         vis_imgs.append(np.zeros((900, 1600, 3), dtype=np.uint8))
                 
-                # 绘制BEV视图（保持不变，使用旋转后的点云）
-                bev_view = draw_bev_view(zmq_data["lidar"], valid_bboxes, valid_scores)
+                # 绘制BEV视图（传入点云缩放因子）
+                bev_view = draw_bev_view(zmq_data["lidar"], valid_bboxes, valid_scores, point_scale=POINT_RANGE_SCALE)
                 
                 # 融合图像（保持不变）
                 final_img = fuse_img_bev(vis_imgs, bev_view)
